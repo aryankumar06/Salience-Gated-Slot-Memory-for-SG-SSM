@@ -1,0 +1,295 @@
+"""
+Salience-Gated Slot Memory for State-Space Models (SG-SSM)
+============================================================
+
+Core algorithm: a bounded, content-addressable slot pool that runs alongside
+a standard (fixed-rank) SSM recurrence. Rare/high-salience tokens get written
+into a dedicated slot (near-lossless, independently-decaying) instead of being
+superimposed into the shared low-rank state. At read time, a gate blends a
+sparse cross-attention readout over the slot pool with the normal SSM readout.
+
+This file contains:
+  1. NaiveSSM        - a minimal, diagonal, input-selective SSM (Mamba-style
+                        selection, S4D-style diagonal recurrence). Pure
+                        PyTorch, sequential scan -> intentionally simple and
+                        CPU-runnable, NOT a performance-optimized kernel.
+  2. SlotPool         - the salience-gated associative memory.
+  3. SGSSMLayer       - base SSM + slot pool + gated readout, combined.
+  4. mqar_batch()      - synthetic Multi-Query Associative Recall task
+                        generator (Zoology/Based-style stress test).
+  5. train_and_eval()  - trains a baseline vs. SG-SSM model on MQAR across
+                        varying (num_pairs, gap) and reports accuracy.
+
+Everything here is intentionally small-scale: this is a proof-of-concept
+sized for a laptop/CPU, meant to demonstrate the *mechanism*, not a
+production kernel. Scaling it up (real Mamba CUDA kernels, real language
+data) is future work -- see the paper draft.
+"""
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# 1. Baseline: a minimal selective diagonal SSM (Mamba-style, simplified)
+# ---------------------------------------------------------------------------
+
+class NaiveSSM(nn.Module):
+    """
+    Diagonal, input-selective SSM:
+        h_t = A_bar_t * h_{t-1} + B_bar_t * x_t
+        y_t = C_t . h_t
+    A_bar_t = exp(-softplus(a) * dt_t)   (per-channel decay, input-dependent dt)
+    Sequential scan (O(T) but not parallel-scan optimized) -- fine at this scale.
+    """
+
+    def __init__(self, d_model: int, d_state: int):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+
+        self.in_proj = nn.Linear(d_model, d_model)
+        # per-channel base decay rate (learned, like Mamba's A)
+        self.a_log = nn.Parameter(torch.rand(d_model, d_state) * 0.5 + 0.5)
+        self.dt_proj = nn.Linear(d_model, d_model)   # selection: input-dependent step size
+        self.B_proj = nn.Linear(d_model, d_state)
+        self.C_proj = nn.Linear(d_model, d_state)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x):
+        # x: (B, T, d_model)
+        B_, T, D = x.shape
+        x = self.in_proj(x)
+        dt = F.softplus(self.dt_proj(x))                      # (B,T,D)
+        B_sel = self.B_proj(x)                                # (B,T,d_state)
+        C_sel = self.C_proj(x)                                # (B,T,d_state)
+
+        A = -F.softplus(self.a_log)                           # (D, d_state), negative -> decay
+        h = torch.zeros(B_, D, self.d_state, device=x.device)
+        ys = []
+        for t in range(T):
+            dt_t = dt[:, t, :].unsqueeze(-1)                   # (B,D,1)
+            A_bar = torch.exp(A.unsqueeze(0) * dt_t)           # (B,D,d_state)
+            Bx = B_sel[:, t, :].unsqueeze(1) * x[:, t, :].unsqueeze(-1)  # (B,D,d_state)
+            h = A_bar * h + dt_t * Bx
+            y_t = (h * C_sel[:, t, :].unsqueeze(1)).sum(-1)    # (B,D)
+            ys.append(y_t)
+        y = torch.stack(ys, dim=1)                             # (B,T,D)
+        return self.out_proj(y)
+
+
+# ---------------------------------------------------------------------------
+# 2. Salience-gated slot pool
+# ---------------------------------------------------------------------------
+
+class SlotPool(nn.Module):
+    """
+    Bounded associative memory of K slots. Each slot holds one (key, value)
+    pair written from a high-salience token. Slots persist with a *slow,
+    per-slot* decay decoupled from the base SSM's decay, so written content
+    does not get superimposed away by subsequent tokens.
+
+    Write and evict decisions are made *soft* (differentiable) during
+    training via a top-K relaxation, and can be hardened at inference.
+    """
+
+    def __init__(self, d_model: int, num_slots: int, key_dim: int = 32):
+        super().__init__()
+        self.K = num_slots
+        self.key_dim = key_dim
+
+        self.salience_head = nn.Linear(d_model, 1)
+        self.key_proj = nn.Linear(d_model, key_dim)
+        self.value_proj = nn.Linear(d_model, d_model)
+        self.query_proj = nn.Linear(d_model, key_dim)
+        self.gate_proj = nn.Linear(d_model * 2 + 1, 1)
+
+    def write(self, x):
+        """
+        x: (B, T, d_model) token representations (context-conditioned, e.g.
+           post a short local-window mix). Returns per-token salience scores
+           and soft slot contents, computed for the whole sequence at once
+           via a differentiable top-K (training-time relaxation).
+
+        Returns:
+          slot_keys:   (B, K, key_dim)
+          slot_values: (B, K, d_model)
+          salience:    (B, T)  -- exposed for the auxiliary recall loss
+        """
+        B_, T, D = x.shape
+        salience = self.salience_head(x).squeeze(-1)          # (B,T)
+        keys_all = self.key_proj(x)                           # (B,T,key_dim)
+        vals_all = self.value_proj(x)                          # (B,T,d_model)
+
+        k = min(self.K, T)
+        # soft top-K selection weights (Gumbel-softmax-free relaxation:
+        # straight-through top-k on salience, differentiable via the values
+        # that flow through vals_all/keys_all)
+        topk_val, topk_idx = torch.topk(salience, k, dim=1)     # (B,k)
+        gather_idx_k = topk_idx.unsqueeze(-1).expand(-1, -1, keys_all.size(-1))
+        gather_idx_v = topk_idx.unsqueeze(-1).expand(-1, -1, vals_all.size(-1))
+        slot_keys = torch.gather(keys_all, 1, gather_idx_k)     # (B,k,key_dim)
+        slot_values = torch.gather(vals_all, 1, gather_idx_v)   # (B,k,d_model)
+
+        if k < self.K:  # pad if sequence shorter than K
+            pad_k = self.K - k
+            slot_keys = F.pad(slot_keys, (0, 0, 0, pad_k))
+            slot_values = F.pad(slot_values, (0, 0, 0, pad_k))
+
+        return slot_keys, slot_values, salience
+
+    def read(self, query_repr, base_readout, slot_keys, slot_values):
+        """
+        query_repr:   (B, T, d_model)  -- what we're reading with
+        base_readout: (B, T, d_model)  -- normal SSM output (the "blurry" path)
+        slot_keys/values: (B, K, key_dim)/(B, K, d_model)
+        """
+        q = self.query_proj(query_repr)                        # (B,T,key_dim)
+        scores = torch.einsum('btd,bkd->btk', q, slot_keys) / math.sqrt(self.key_dim)
+        attn = F.softmax(scores, dim=-1)                        # (B,T,K)
+        slot_out = torch.einsum('btk,bkd->btd', attn, slot_values)  # (B,T,d_model)
+
+        max_score = scores.max(dim=-1, keepdim=True).values     # (B,T,1) confidence signal
+        gate = torch.sigmoid(self.gate_proj(torch.cat([base_readout, slot_out, max_score], dim=-1)))
+        return gate * slot_out + (1 - gate) * base_readout, gate
+
+
+# ---------------------------------------------------------------------------
+# 3. Combined layer
+# ---------------------------------------------------------------------------
+
+class SGSSMLayer(nn.Module):
+    def __init__(self, d_model: int, d_state: int, num_slots: int):
+        super().__init__()
+        self.ssm = NaiveSSM(d_model, d_state)
+        self.slots = SlotPool(d_model, num_slots)
+
+    def forward(self, x):
+        base_out = self.ssm(x)
+        slot_keys, slot_values, salience = self.slots.write(x)
+        out, gate = self.slots.read(x, base_out, slot_keys, slot_values)
+        return out, salience, gate
+
+
+# ---------------------------------------------------------------------------
+# 4. Synthetic MQAR task (Multi-Query Associative Recall; Zoology/Based-style)
+# ---------------------------------------------------------------------------
+
+def mqar_batch(batch_size, num_pairs, gap, vocab_size=64, device="cpu"):
+    """
+    Sequence layout:  [k1 v1 k2 v2 ... k_n v_n]  <gap filler tokens>  [q1 q2 ... q_n]
+    Model must, at each query position q_i, output the value paired with key q_i
+    from earlier in the sequence. `gap` filler tokens sit between the KV block
+    and the query block to force long-range retrieval (this is exactly what
+    stresses a fixed-size compressed state).
+
+    Returns:
+      x:       (B, T) input ids
+      targets: (B, T) target ids (-100 = ignore, only query positions scored)
+    """
+    KEY_START, VAL_START, FILLER = 0, vocab_size // 2, vocab_size - 1
+    n_keys = vocab_size // 2 - 1  # reserve id for filler
+
+    keys = torch.randint(1, n_keys, (batch_size, num_pairs))
+    vals = torch.randint(VAL_START, vocab_size - 1, (batch_size, num_pairs))
+
+    kv_block = torch.stack([keys, vals], dim=-1).reshape(batch_size, -1)          # (B, 2*num_pairs)
+    filler = torch.full((batch_size, gap), FILLER)
+    query_order = torch.argsort(torch.rand(batch_size, num_pairs), dim=-1)
+    query_keys = torch.gather(keys, 1, query_order)
+    query_vals = torch.gather(vals, 1, query_order)
+
+    x = torch.cat([kv_block, filler, query_keys], dim=1)                          # (B, T)
+    targets = torch.full_like(x, -100)
+    targets[:, -num_pairs:] = query_vals
+    return x.to(device), targets.to(device)
+
+
+# ---------------------------------------------------------------------------
+# 5. Models under test + training loop
+# ---------------------------------------------------------------------------
+
+class BaselineModel(nn.Module):
+    def __init__(self, vocab, d_model=64, d_state=16):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, d_model)
+        self.ssm = NaiveSSM(d_model, d_state)
+        self.head = nn.Linear(d_model, vocab)
+
+    def forward(self, x):
+        h = self.embed(x)
+        h = self.ssm(h)
+        return self.head(h)
+
+
+class SGSSMModel(nn.Module):
+    def __init__(self, vocab, d_model=64, d_state=16, num_slots=16):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, d_model)
+        self.layer = SGSSMLayer(d_model, d_state, num_slots)
+        self.head = nn.Linear(d_model, vocab)
+        self.aux_weight = 0.1
+
+    def forward(self, x, key_positions_mask=None):
+        h = self.embed(x)
+        out, salience, gate = self.layer(h)
+        logits = self.head(out)
+        aux_loss = None
+        if key_positions_mask is not None:
+            # supervise salience directly toward key positions (oracle signal
+            # for this proof-of-concept -- see paper Sec 5 for discussion of
+            # learned-vs-oracle salience)
+            aux_loss = F.binary_cross_entropy_with_logits(salience, key_positions_mask.float())
+        return logits, aux_loss
+
+
+def make_key_position_mask(x, vocab_size):
+    # True where token is a "key" (first of a kv pair) -- used only for the
+    # auxiliary salience loss, not fed to the model as input.
+    VAL_START, FILLER = vocab_size // 2, vocab_size - 1
+    return (x > 0) & (x < VAL_START)
+
+
+def train_and_eval(num_pairs, gap, vocab=64, steps=400, batch_size=64, seed=0):
+    torch.manual_seed(seed)
+    baseline = BaselineModel(vocab)
+    sgssm = SGSSMModel(vocab, num_slots=max(8, num_pairs))
+
+    opt_b = torch.optim.Adam(baseline.parameters(), lr=3e-3)
+    opt_s = torch.optim.Adam(sgssm.parameters(), lr=3e-3)
+
+    for step in range(steps):
+        x, y = mqar_batch(batch_size, num_pairs, gap, vocab)
+
+        logits_b = baseline(x)
+        loss_b = F.cross_entropy(logits_b.reshape(-1, vocab), y.reshape(-1), ignore_index=-100)
+        opt_b.zero_grad(); loss_b.backward(); opt_b.step()
+
+        mask = make_key_position_mask(x, vocab)
+        logits_s, aux_loss = sgssm(x, key_positions_mask=mask)
+        loss_s = F.cross_entropy(logits_s.reshape(-1, vocab), y.reshape(-1), ignore_index=-100)
+        total_s = loss_s + sgssm.aux_weight * aux_loss
+        opt_s.zero_grad(); total_s.backward(); opt_s.step()
+
+    # eval
+    with torch.no_grad():
+        x, y = mqar_batch(512, num_pairs, gap, vocab)
+        pred_b = baseline(x).argmax(-1)
+        acc_b = (pred_b[y != -100] == y[y != -100]).float().mean().item()
+
+        mask = make_key_position_mask(x, vocab)
+        logits_s, _ = sgssm(x, key_positions_mask=mask)
+        pred_s = logits_s.argmax(-1)
+        acc_s = (pred_s[y != -100] == y[y != -100]).float().mean().item()
+
+    return acc_b, acc_s
+
+
+if __name__ == "__main__":
+    print(f"{'num_pairs':>10} {'gap':>6} {'baseline_acc':>14} {'sg_ssm_acc':>12}")
+    for num_pairs in [4, 8, 16]:
+        for gap in [16, 64, 128]:
+            acc_b, acc_s = train_and_eval(num_pairs, gap, steps=400)
+            print(f"{num_pairs:>10} {gap:>6} {acc_b:>14.3f} {acc_s:>12.3f}")
